@@ -226,12 +226,15 @@ impl LayerWeights {
         // reshape Q to group queries by KV head and compute attention per group.
         // This eliminates 2× memory copy of K and V tensors.
         let n_rep = self.n_head / self.n_kv_head;
-        let (_, _, _seq_len_kv, _) = k.dims4()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
 
-        let attn_output = if n_rep == 1 {
-            // No GQA needed — standard MHA path
+        let attn_output = if n_rep == 1 || seq_len <= 1 {
+            // Standard path: no GQA broadcast needed (MHA) or single-token decode
+            // (where tensors are tiny and repeat_kv overhead is negligible).
+            let k = crate::utils::repeat_kv(k, n_rep)?;
+            let v = crate::utils::repeat_kv(v, n_rep)?;
+
             let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
             if let Some(mask) = mask {
@@ -243,13 +246,14 @@ impl LayerWeights {
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             attn_weights.matmul(&v)?
         } else {
-            // GQA broadcast path:
+            // GQA broadcast path for prefill (seq_len > 1):
             // Q: [B, n_heads, Sq, D] → [B, n_kv_heads, n_rep, Sq, D]
-            // K: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, 1, Skv, D]
-            // V: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, 1, Skv, D]
+            // K: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, n_rep, Skv, D] (expand = strided view)
+            // V: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, n_rep, Skv, D]
+            let (_, _, seq_len_kv, _) = k.dims4()?;
             let q = q.reshape((b_sz, self.n_kv_head, n_rep, seq_len, self.head_dim))?;
-            let k = k.unsqueeze(2)?;
-            let v = v.unsqueeze(2)?;
+            let k = k.unsqueeze(2)?.expand((b_sz, self.n_kv_head, n_rep, seq_len_kv, self.head_dim))?.contiguous()?;
+            let v = v.unsqueeze(2)?.expand((b_sz, self.n_kv_head, n_rep, seq_len_kv, self.head_dim))?.contiguous()?;
 
             let mut attn_weights = (q.matmul(&k.transpose(3, 4)?)? * scale)?;
 
