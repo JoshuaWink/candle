@@ -141,6 +141,7 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
+    #[allow(dead_code)]
     fn mask(
         &self,
         b_sz: usize,
@@ -221,22 +222,48 @@ impl LayerWeights {
         };
         self.kv_cache = Some((k.clone(), v.clone())); // update cache
 
-        // Repeat KV for GQA
-        let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
-        let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
+        // GQA Broadcast: Instead of repeat_kv (which copies K,V to match n_heads),
+        // reshape Q to group queries by KV head and compute attention per group.
+        // This eliminates 2× memory copy of K and V tensors.
+        let n_rep = self.n_head / self.n_kv_head;
+        let (_, _, _seq_len_kv, _) = k.dims4()?;
 
-        // Scaled Dot-Product Attention
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
-        if let Some(mask) = mask {
-            let mask = mask.broadcast_as(attn_weights.shape())?;
-            let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
-            attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
-        }
+        let attn_output = if n_rep == 1 {
+            // No GQA needed — standard MHA path
+            let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
+            if let Some(mask) = mask {
+                let mask = mask.broadcast_as(attn_weights.shape())?;
+                let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+                attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+            }
+
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&v)?
+        } else {
+            // GQA broadcast path:
+            // Q: [B, n_heads, Sq, D] → [B, n_kv_heads, n_rep, Sq, D]
+            // K: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, 1, Skv, D]
+            // V: [B, n_kv_heads, Skv, D] → [B, n_kv_heads, 1, Skv, D]
+            let q = q.reshape((b_sz, self.n_kv_head, n_rep, seq_len, self.head_dim))?;
+            let k = k.unsqueeze(2)?;
+            let v = v.unsqueeze(2)?;
+
+            let mut attn_weights = (q.matmul(&k.transpose(3, 4)?)? * scale)?;
+
+            if let Some(mask) = mask {
+                let mask = mask.broadcast_as(attn_weights.shape())?;
+                let neg_inf = self.neg_inf.broadcast_as(attn_weights.dims())?;
+                attn_weights = mask.eq(0u32)?.where_cond(&neg_inf, &attn_weights)?;
+            }
+
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let out = attn_weights.matmul(&v)?;
+            // Reshape back: [B, n_kv_heads, n_rep, Sq, D] → [B, n_heads, Sq, D]
+            out.reshape((b_sz, self.n_head, seq_len, self.head_dim))?
+        };
 
         let attn_output = attn_output
             .transpose(1, 2)?
@@ -443,17 +470,67 @@ impl ModelWeights {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
 
+        // Pre-compute masks ONCE and share across all layers of the same type.
+        // Eliminates 34 separate CPU→GPU allocations per forward pass.
+        let (causal_mask, sliding_mask) = if seq_len == 1 {
+            (None, None)
+        } else {
+            // Find sliding window size from first sliding layer
+            let sliding_window_size = self
+                .layers
+                .iter()
+                .find_map(|l| l.sliding_window_size);
+
+            let causal = {
+                let mask: Vec<u32> = (0..seq_len)
+                    .flat_map(|i| (0..seq_len).map(move |j| if i < j { 0u32 } else { 1u32 }))
+                    .collect();
+                let mask = Tensor::from_slice(&mask, (seq_len, seq_len), x.device())?;
+                let mask = if index_pos > 0 {
+                    let prefix = Tensor::zeros((seq_len, index_pos), DType::F32, x.device())?;
+                    Tensor::cat(&[&prefix, &mask], D::Minus1)?
+                } else {
+                    mask
+                };
+                Some(mask.expand((b_sz, 1, seq_len, seq_len + index_pos))?.to_dtype(x.dtype())?)
+            };
+
+            let sliding = if let Some(window_size) = sliding_window_size {
+                let mask: Vec<u32> = (0..seq_len)
+                    .flat_map(|i| {
+                        (0..seq_len).map(move |j| {
+                            if i < j || j + window_size < i { 0u32 } else { 1u32 }
+                        })
+                    })
+                    .collect();
+                let mask = Tensor::from_slice(&mask, (seq_len, seq_len), x.device())?;
+                let mask = if index_pos > 0 {
+                    let prefix = Tensor::zeros((seq_len, index_pos), DType::F32, x.device())?;
+                    Tensor::cat(&[&prefix, &mask], D::Minus1)?
+                } else {
+                    mask
+                };
+                Some(mask.expand((b_sz, 1, seq_len, seq_len + index_pos))?.to_dtype(x.dtype())?)
+            } else {
+                None
+            };
+
+            (causal, sliding)
+        };
+
         for layer in self.layers.iter_mut() {
             let attention_mask = if seq_len == 1 {
                 None
+            } else if layer.sliding_window_size.is_some() {
+                sliding_mask.as_ref()
             } else {
-                Some(layer.mask(b_sz, seq_len, index_pos, x.dtype(), x.device())?)
+                causal_mask.as_ref()
             };
 
             // Attention block
             let residual = &layer_in;
             let x = layer.attention_norm.forward(&layer_in)?;
-            let x = layer.forward_attn(&x, attention_mask.as_ref(), index_pos)?;
+            let x = layer.forward_attn(&x, attention_mask, index_pos)?;
             let x = layer.post_attention_norm.forward(&x)?;
             let x = (x + residual)?;
 
